@@ -16,7 +16,7 @@ const queue = new Queue(2, Infinity);
 
 const session = bhttp.session();
 
-const config = yaml.safeLoad(fs.readFileSync('config.yml', 'utf8'));
+let config = yaml.safeLoad(fs.readFileSync('config.yml', 'utf8'));
 
 config.captureDirectory = config.captureDirectory || 'capture';
 config.completeDirectory = config.completeDirectory || 'complete';
@@ -272,6 +272,8 @@ function mainLoop() {
       });
 
       printMsg('Done, will search for new models in', config.modelScanInterval, 'second(s).');
+
+      config = yaml.safeLoad(fs.readFileSync('config.yml', 'utf8'));
 
       setTimeout(mainLoop, config.modelScanInterval * 1000);
     });
