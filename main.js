@@ -3,20 +3,16 @@ const fs = Promise.promisifyAll(require('fs'));
 const childProcess = require('child_process');
 const path = require('path');
 const bhttp = require('bhttp');
+const cheerio = require('cheerio');
 const colors = require('colors');
 const moment = require('moment');
 const yaml = require('js-yaml');
-const WebSocketClient = require('websocket').client;
 const mvAsync = Promise.promisify(require('mv'));
 const mkdirpAsync = Promise.promisify(require('mkdirp'));
-const Queue = require('promise-queue');
-
-Queue.configure(Promise.Promise);
-const queue = new Queue(2, Infinity);
 
 const session = bhttp.session();
 
-let config = yaml.safeLoad(fs.readFileSync('config.yml', 'utf8'));
+const config = yaml.safeLoad(fs.readFileSync('config.yml', 'utf8'));
 
 config.captureDirectory = config.captureDirectory || 'capture';
 config.completeDirectory = config.completeDirectory || 'complete';
@@ -41,171 +37,70 @@ function printMsg(...args) {
 const printErrorMsg = printMsg.bind(printMsg, colors.red('[ERROR]'));
 const printDebugMsg = config.debug ? printMsg.bind(printMsg, colors.yellow('[DEBUG]')) : () => {};
 
-function getRtmpArguments(model) {
+function captureModel(params) {
+  const { model, streamServer, playpath } = params;
+
   return Promise
-    .try(() => session.get(`http://showup.tv/${model}`))
-    .then((response) => {
-      const rawHTML = response.body.toString('utf8');
+    .try(() => {
+      printMsg(colors.green(model), 'is online, starting rtmpdump process');
 
-      const startChildBug = rawHTML.match(/startChildBug\(user\.uid, '([^']*)', '([^']*)'/);
+      const filename = `${model}_${moment().format(config.dateFormat)}.flv`;
 
-      if (!startChildBug || !startChildBug[2]) {
-        throw new Error('startChildBug is unavailable');
-      }
+      const spawnArguments = [
+        '--live',
+        config.rtmpDebug ? '' : '--quiet',
+        '--rtmp', `rtmp://${streamServer}:1935/webrtc`,
+        '--playpath', `${playpath}_aac`,
+        '--flv', path.join(captureDirectory, filename),
+      ];
 
-      const csrf = startChildBug[1];
-      const wsUrl = startChildBug[2];
+      printDebugMsg('spawnArguments:', spawnArguments);
 
-      printDebugMsg('csrf:', csrf, 'wsUrl:', wsUrl);
+      const proc = childProcess.spawn('rtmpdump', spawnArguments);
 
-      const user = rawHTML.match(/var transUser = new User\(([\s\S]+?),/);
+      proc.stdout.on('data', (data) => {
+        printMsg(data.toString());
+      });
 
-      if (!user || !user[1]) {
-        throw new Error('User\'s uid is unavailable');
-      }
+      proc.stderr.on('data', (data) => {
+        printMsg(data.toString());
+      });
 
-      const userUid = user[1];
+      proc.on('close', () => {
+        printMsg(colors.green(model), 'stopped streaming');
 
-      printDebugMsg('userUid:', userUid);
+        captures = captures.filter(c => c.model !== model);
 
-      return { csrf, wsUrl, userUid };
-    })
-    .timeout(10000)
-    .then((params) => {
-      let webSocketConnection;
+        const src = path.join(captureDirectory, filename);
+        const dst = config.createModelDirectory
+          ? path.join(completeDirectory, model, filename)
+          : path.join(completeDirectory, filename);
 
-      return new Promise((resolve, reject) => {
-        const client = new WebSocketClient();
-        const rtmpArguments = {};
-
-        client.on('connectFailed', reject);
-
-        client.on('connect', (connection) => {
-          webSocketConnection = connection;
-
-          connection.on('error', reject);
-
-          connection.on('message', (message) => {
-            if (message.type === 'utf8') {
-              const json = JSON.parse(message.utf8Data);
-
-              if (json.id === 102 && json.value[0]) {
-                if (json.value[0] === 'failure') {
-                  printDebugMsg(colors.green(model), 'might be offline');
-
-                  resolve(null);
-                } else if (json.value[0] === 'alreadyJoined') {
-                  reject(new Error('Another stream of this model exists'));
-                } else {
-                  rtmpArguments.streamServer = json.value[1];
-                }
-              }
-
-              if (json.id === 103 && json.value[0]) {
-                rtmpArguments.playpath = `${json.value[0]}_aac`;
-              }
-
-              if (json.id === 143 && json.value[0] === '0') {
-                // printDebugMsg('Logged in');
-              }
-
-              if (rtmpArguments.streamServer && rtmpArguments.playpath) {
-                resolve(rtmpArguments);
-              }
+        fs.statAsync(src)
+          // if the file is big enough we keep it otherwise we delete it
+          .then(stats => (stats.size <= minFileSize
+            ? fs.unlinkAsync(src)
+            : mvAsync(src, dst, { mkdirp: true })
+          ))
+          .catch((err) => {
+            if (err.code !== 'ENOENT') {
+              printErrorMsg(colors.red(`[${model}]`), err.toString());
             }
           });
+      });
 
-          connection.sendUTF(`{ "id": 0, "value": [${params.userUid}, "${params.csrf}"]}`);
-          connection.sendUTF(`{ "id": 2, "value": ["${model}"]}`);
+      if (proc.pid) {
+        captures.push({
+          model,
+          filename,
+          proc,
+          checkAfter: moment().unix() + 60, // we are gonna check the process after 60 seconds
+          size: 0,
         });
-
-        client.connect(`ws://${params.wsUrl}`, '');
-      })
-        .timeout(10000)
-        .finally(() => {
-          printDebugMsg('Close WebSocket connection');
-
-          if (webSocketConnection) {
-            webSocketConnection.close();
-          }
-        });
-    });
-}
-
-function captureModel(model) {
-  const capture = captures.find(c => c.model === model);
-
-  // this should never happen, but just in case...
-  if (capture) {
-    printDebugMsg(colors.green(model), 'is already capturing');
-    return null; // resolve immediately
-  }
-
-  return Promise
-    .try(() => getRtmpArguments(model))
-    .then((rtmpArguments) => {
-      // if rtmpArguments is not set then the model is offline or there weres some issues
-      if (rtmpArguments) {
-        printMsg(colors.green(model), 'is online, starting rtmpdump process');
-
-        const filename = `${model}_${moment().format(config.dateFormat)}.flv`;
-
-        const spawnArguments = [
-          '--live',
-          config.rtmpDebug ? '' : '--quiet',
-          '--rtmp', `rtmp://${rtmpArguments.streamServer}:1935/webrtc`,
-          '--playpath', rtmpArguments.playpath,
-          '--flv', path.join(captureDirectory, filename),
-        ];
-
-        printDebugMsg('spawnArguments:', spawnArguments);
-
-        const proc = childProcess.spawn('rtmpdump', spawnArguments);
-
-        proc.stdout.on('data', (data) => {
-          printMsg(data.toString());
-        });
-
-        proc.stderr.on('data', (data) => {
-          printMsg(data.toString());
-        });
-
-        proc.on('close', () => {
-          printMsg(colors.green(model), 'stopped streaming');
-
-          captures = captures.filter(c => c.model !== model);
-
-          const src = path.join(captureDirectory, filename);
-          const dst = config.createModelDirectory
-            ? path.join(completeDirectory, model, filename)
-            : path.join(completeDirectory, filename);
-
-          fs.statAsync(src)
-            // if the file is big enough we keep it otherwise we delete it
-            .then(stats => (stats.size <= minFileSize
-              ? fs.unlinkAsync(src)
-              : mvAsync(src, dst, { mkdirp: true })
-            ))
-            .catch((err) => {
-              if (err.code !== 'ENOENT') {
-                printErrorMsg(colors.red(`[${model}]`), err.toString());
-              }
-            });
-        });
-
-        if (proc.pid) {
-          captures.push({
-            model,
-            filename,
-            proc,
-            checkAfter: moment().unix() + 60, // we are gonna check the process after 60 seconds
-            size: 0,
-          });
-        }
       }
     })
     .catch((err) => {
-      printErrorMsg(colors.red(`[${model}]`), err.toString());
+      printErrorMsg(colors.red(`[${model.model}]`), err.toString());
     });
 }
 
@@ -248,22 +143,29 @@ function mainLoop() {
   printDebugMsg('Start searching for new models');
 
   return Promise
-    .try(() => config.models.filter(m => !captures.find(p => p.model === m)))
-    .then(modelsToCapture => new Promise((resolve) => {
-      printDebugMsg(`${modelsToCapture.length} model(s) to capture`);
+    .try(() => session.get('https://showup.tv'))
+    .then(response => cheerio.load(response.body))
+    .then(($) => {
+      const onlineModels = [];
 
-      if (modelsToCapture.length === 0) {
-        resolve();
-      } else {
-        modelsToCapture.forEach((m) => {
-          queue.add(() => captureModel(m)).then(() => {
-            if ((queue.getPendingLength() + queue.getQueueLength()) === 0) {
-              resolve();
-            }
-          });
+      $('li[transcoderaddr][streamid]').each((i, e) => {
+        // printDebugMsg(e);
+        onlineModels.push({
+          model: $(e).find('.stream__meta h4').text(),
+          streamServer: e.attribs.transcoderaddr,
+          playpath: e.attribs.streamid,
         });
-      }
-    }))
+      });
+
+      return onlineModels;
+    })
+    .then((onlineModels) => {
+      const configModels = yaml.safeLoad(fs.readFileSync('config.yml', 'utf8')).models;
+
+      return onlineModels.filter(o => configModels.find(m => m === o.model));
+    })
+    .then(modelsToCapture => modelsToCapture.filter(m => !captures.find(p => p.model === m.model)))
+    .then(modelsToCapture => Promise.all(modelsToCapture.map(captureModel)))
     .then(() => Promise.all(captures.map(checkCapture)))
     .catch(printErrorMsg)
     .finally(() => {
@@ -272,8 +174,6 @@ function mainLoop() {
       });
 
       printMsg('Done, will search for new models in', config.modelScanInterval, 'second(s).');
-
-      config = yaml.safeLoad(fs.readFileSync('config.yml', 'utf8'));
 
       setTimeout(mainLoop, config.modelScanInterval * 1000);
     });
